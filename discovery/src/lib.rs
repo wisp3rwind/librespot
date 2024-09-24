@@ -39,6 +39,25 @@ pub enum DiscoveryEvent {
     ZeroconfError(DiscoveryError),
 }
 
+pub struct DnsSdHandle {
+    task_handle: tokio::task::JoinHandle<()>,
+    shutdown_tx: oneshot::Sender<Infallible>,
+}
+
+impl DnsSdHandle {
+    async fn shutdown(self) {
+        log::debug!("Shutting down zeroconf responder");
+        let Self {
+            task_handle,
+            shutdown_tx,
+            ..
+        } = self;
+        std::mem::drop(shutdown_tx);
+        let _ = task_handle.await;
+        log::debug!("Zeroconf responder stopped");
+    }
+}
+
 pub type ServiceBuilder =
     fn(Cow<'static, str>, Vec<std::net::IpAddr>, u16, mpsc::UnboundedSender<DiscoveryEvent>) -> Result<DnsSdHandle, Error>;
 
@@ -188,25 +207,6 @@ async fn avahi_task(
     let _: () = std::future::pending().await;
 
     Ok(())
-}
-
-pub struct DnsSdHandle {
-    task_handle: tokio::task::JoinHandle<()>,
-    shutdown_tx: oneshot::Sender<Infallible>,
-}
-
-impl DnsSdHandle {
-    async fn shutdown(self) {
-        log::debug!("Shutting down zeroconf responder");
-        let Self {
-            task_handle,
-            shutdown_tx,
-            ..
-        } = self;
-        std::mem::drop(shutdown_tx);
-        let _ = task_handle.await;
-        log::debug!("Zeroconf responder stopped");
-    }
 }
 
 #[cfg(feature = "with-avahi")]
