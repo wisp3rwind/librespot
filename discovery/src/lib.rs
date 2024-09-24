@@ -20,6 +20,7 @@ use std::{
 
 use futures_core::Stream;
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 use self::server::DiscoveryServer;
 
@@ -177,7 +178,7 @@ async fn avahi_task(
 
 pub struct DnsSdHandle {
     task_handle: tokio::task::JoinHandle<()>,
-    shutdown_tx: tokio::sync::oneshot::Sender<Infallible>,
+    shutdown_tx: oneshot::Sender<Infallible>,
 }
 
 impl DnsSdHandle {
@@ -199,7 +200,7 @@ fn launch_avahi(
     _zeroconf_ip: Vec<std::net::IpAddr>,
     port: u16,
 ) -> Result<DnsSdHandle, Error> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task_handle = tokio::spawn(async move {
         let mut entry_group = None;
         tokio::select! {
@@ -232,7 +233,7 @@ fn launch_dns_sd(
     _zeroconf_ip: Vec<std::net::IpAddr>,
     port: u16,
 ) -> Result<DnsSdHandle, Error> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task_handle = tokio::task::spawn_blocking(move || {
         let svc = dns_sd::DNSService::register(
             Some(name.as_ref()),
@@ -262,7 +263,7 @@ fn launch_libmdns(
     zeroconf_ip: Vec<std::net::IpAddr>,
     port: u16,
 ) -> Result<DnsSdHandle, Error> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task_handle = tokio::task::spawn_blocking(move || {
         let svc = if !zeroconf_ip.is_empty() {
             libmdns::Responder::spawn_with_ip_list(&tokio::runtime::Handle::current(), zeroconf_ip)
