@@ -45,4 +45,4 @@ with-avahi = ["zbus", "serde"]
 with-dns-sd = ["dns-sd"]
 with-libmdns = ["libmdns"]
 
-default = ["with-libmdns"]
+default = ["with-libmdns", "with-avahi", "with-dns-sd"]
