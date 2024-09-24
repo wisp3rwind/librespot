@@ -20,7 +20,7 @@ use std::{
 
 use futures_core::Stream;
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use self::server::DiscoveryServer;
 
@@ -33,8 +33,14 @@ pub use crate::core::authentication::Credentials;
 /// Determining the icon in the list of available devices.
 pub use crate::core::config::DeviceType;
 
+pub enum DiscoveryEvent {
+    Credentials(Credentials),
+    ServerError(DiscoveryError),
+    ZeroconfError(DiscoveryError),
+}
+
 pub type ServiceBuilder =
-    fn(Cow<'static, str>, Vec<std::net::IpAddr>, u16) -> Result<DnsSdHandle, Error>;
+    fn(Cow<'static, str>, Vec<std::net::IpAddr>, u16, mpsc::UnboundedSender<DiscoveryEvent>) -> Result<DnsSdHandle, Error>;
 
 // Default goes first: This matches the behaviour when feature flags were exlusive, i.e. when there
 // was only `feature = "with-dns-sd"` or `not(feature = "with-dns-sd")`
@@ -90,6 +96,8 @@ pub struct Discovery {
     /// An opaque handle to the DNS-SD service. Dropping this will unregister the service.
     #[allow(unused)]
     svc: DnsSdHandle,
+
+    event_rx: mpsc::UnboundedReceiver<DiscoveryEvent>,
 }
 
 /// A builder for [`Discovery`].
@@ -119,6 +127,12 @@ pub enum DiscoveryError {
     ParamsError(&'static str),
 }
 
+impl From<zbus::Error> for DiscoveryError {
+    fn from(error: zbus::Error) -> Self {
+        Self::DnsSdError(Box::new(error))
+    }
+}
+
 impl From<DiscoveryError> for Error {
     fn from(err: DiscoveryError) -> Self {
         match err {
@@ -141,7 +155,7 @@ async fn avahi_task(
     name: Cow<'static, str>,
     port: u16,
     entry_group: &mut Option<avahi::EntryGroupProxy<'_>>,
-) -> zbus::Result<()> {
+) -> Result<(), DiscoveryError> {
     use self::avahi::ServerProxy;
 
     let conn = zbus::Connection::system().await?;
@@ -187,6 +201,7 @@ impl DnsSdHandle {
         let Self {
             task_handle,
             shutdown_tx,
+            ..
         } = self;
         std::mem::drop(shutdown_tx);
         let _ = task_handle.await;
@@ -199,14 +214,17 @@ fn launch_avahi(
     name: Cow<'static, str>,
     _zeroconf_ip: Vec<std::net::IpAddr>,
     port: u16,
+    status_tx: mpsc::UnboundedSender<DiscoveryEvent>,
 ) -> Result<DnsSdHandle, Error> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
     let task_handle = tokio::spawn(async move {
         let mut entry_group = None;
         tokio::select! {
             res = avahi_task(name, port, &mut entry_group) => {
                 if let Err(e) = res {
-                    log::error!("Avahi error {}, shutting down discovery", e);
+                    log::error!("Avahi error: {}", e);
+                    let _ = status_tx.send(DiscoveryEvent::ZeroconfError(e));
                 }
             },
             _ = shutdown_rx => {
@@ -232,23 +250,33 @@ fn launch_dns_sd(
     name: Cow<'static, str>,
     _zeroconf_ip: Vec<std::net::IpAddr>,
     port: u16,
+    status_tx: mpsc::UnboundedSender<DiscoveryEvent>,
 ) -> Result<DnsSdHandle, Error> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
     let task_handle = tokio::task::spawn_blocking(move || {
-        let svc = dns_sd::DNSService::register(
-            Some(name.as_ref()),
-            DNS_SD_SERVICE_NAME,
-            None,
-            None,
-            port,
-            &TXT_RECORD,
-        )
-        .map_err(|e| DiscoveryError::DnsSdError(Box::new(e)))
-        .unwrap();
+        let inner = move || -> Result<(), DiscoveryError> {
+            let svc = dns_sd::DNSService::register(
+                Some(name.as_ref()),
+                DNS_SD_SERVICE_NAME,
+                None,
+                None,
+                port,
+                &TXT_RECORD,
+            )
+            .map_err(|e| DiscoveryError::DnsSdError(Box::new(e)))?;
 
-        let _ = shutdown_rx.blocking_recv();
+            let _ = shutdown_rx.blocking_recv();
 
-        std::mem::drop(svc);
+            std::mem::drop(svc);
+
+            Ok(())
+        };
+
+        if let Err(e) = inner() {
+            log::error!("dns_sd error: {}", e);
+            let _ = status_tx.send(DiscoveryEvent::ZeroconfError(e));
+        }
     });
 
     Ok(DnsSdHandle {
@@ -262,26 +290,37 @@ fn launch_libmdns(
     name: Cow<'static, str>,
     zeroconf_ip: Vec<std::net::IpAddr>,
     port: u16,
+    status_tx: mpsc::UnboundedSender<DiscoveryEvent>,
 ) -> Result<DnsSdHandle, Error> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
     let task_handle = tokio::task::spawn_blocking(move || {
-        let svc = if !zeroconf_ip.is_empty() {
-            libmdns::Responder::spawn_with_ip_list(&tokio::runtime::Handle::current(), zeroconf_ip)
-        } else {
-            libmdns::Responder::spawn(&tokio::runtime::Handle::current())
+        let inner = move || -> Result<(), DiscoveryError> {
+            let svc = if !zeroconf_ip.is_empty() {
+                libmdns::Responder::spawn_with_ip_list(&tokio::runtime::Handle::current(), zeroconf_ip)
+            } else {
+                libmdns::Responder::spawn(&tokio::runtime::Handle::current())
+            }
+            .map_err(|e| DiscoveryError::DnsSdError(Box::new(e)))
+                .unwrap()
+                .register(
+                    DNS_SD_SERVICE_NAME.to_owned(),
+                    name.into_owned(),
+                    port,
+                    &TXT_RECORD,
+                );
+
+            let _ = shutdown_rx.blocking_recv();
+
+            std::mem::drop(svc);
+
+            Ok(())
+        };
+
+        if let Err(e) = inner() {
+            log::error!("libmdns error: {}", e);
+            let _ = status_tx.send(DiscoveryEvent::ZeroconfError(e));
         }
-        .map_err(|e| DiscoveryError::DnsSdError(Box::new(e)))
-        .unwrap()
-        .register(
-            DNS_SD_SERVICE_NAME.to_owned(),
-            name.into_owned(),
-            port,
-            &TXT_RECORD,
-        );
-
-        let _ = shutdown_rx.blocking_recv();
-
-        std::mem::drop(svc);
     });
 
     Ok(DnsSdHandle {
@@ -352,12 +391,14 @@ impl Builder {
         let name = self.server_config.name.clone();
         let zeroconf_ip = self.zeroconf_ip;
 
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+
         let mut port = self.port;
-        let server = DiscoveryServer::new(self.server_config, &mut port)?;
+        let server = DiscoveryServer::new(self.server_config, &mut port, event_tx.clone())?;
 
         let launch_svc = self.zeroconf_backend.unwrap_or(find(None)?);
-        let svc = launch_svc(name, zeroconf_ip, port)?;
-        Ok(Discovery { server, svc })
+        let svc = launch_svc(name, zeroconf_ip, port, event_tx)?;
+        Ok(Discovery { server, svc, event_rx })
     }
 }
 
@@ -381,6 +422,14 @@ impl Stream for Discovery {
     type Item = Credentials;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.server).poll_next(cx)
+
+        match Pin::new(&mut self.event_rx).poll_recv(cx) {
+            // Yields credentials
+            Poll::Ready(Some(DiscoveryEvent::Credentials(creds))) => Poll::Ready(Some(creds)),
+            // Also terminate the stream on fatal server or MDNS/DNS-SD errors.
+            Poll::Ready(Some(DiscoveryEvent::ServerError(_) | DiscoveryEvent::ZeroconfError(_))) => Poll::Ready(None),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
