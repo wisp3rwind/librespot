@@ -59,6 +59,9 @@ https://github.com/librespot-org/librespot
 - [core] `Credentials.username` is now an `Option` (breaking)
 - [core] `Session::connect` tries multiple access points, retrying each one.
 - [core] Each access point connection now timesout after 3 seconds.
+- [discovery] librespot can now be compiled with multiple MDNS/DNS-SD backends
+  (avahi, dns_sd, libmdns) which can be selected using a CLI flag. The defaults
+  are unchanged.
 - [main] `autoplay {on|off}` now acts as an override. If unspecified, `librespot`
   now follows the setting in the Connect client that controls it. (breaking)
 - [metadata] Most metadata is now retrieved with the `spclient` (breaking)
@@ -95,6 +98,7 @@ https://github.com/librespot-org/librespot
 - [core] Support parsing `SpotifyId` for local files
 - [core] Support parsing `SpotifyId` for named playlists
 - [core] Add checks and handling for stale server connections.
+- [discovery] Added  anew MDNS/DNS-SD backend which connects to Avahi via D-Bus.
 - [main] Add all player events to `player_event_handler.rs`
 - [main] Add an event worker thread that runs async to the main thread(s) but
   sync to itself to prevent potential data races for event consumers
